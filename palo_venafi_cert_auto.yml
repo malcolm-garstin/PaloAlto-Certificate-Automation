@@ -82,7 +82,7 @@
       until: cert_download.status == 200
       no_log: true
 
-  # The next 4 tasks aren't absolutely necessary, but sometimes Palo doesn't like the special characters in the certificate name.
+  # The next 4 tasks aren't absolutely necessary, but sometimes Palo doesn't like the special characters in the certificate chain.
 
     - name: Read the certificate file
       ansible.builtin.slurp:
