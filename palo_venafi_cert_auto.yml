@@ -1,0 +1,117 @@
+---
+- name: Palo Alto Certification Automation
+  hosts: "{{ ansible_limit }}"
+  gather_facts: false
+  connection: local
+
+  vars:
+    cert_filename: "devicecertname"
+    cert_name: "devicecertname.yourdomain.com"
+    venafi_server: "yoursubdomain.venafi.com"
+    device:
+      ip_address: "{{ ansible_host }}"
+      api_key: "{{ pa_api_key }}"
+
+  tasks:
+
+    - name: Generate CSR on Palo device
+    # This is necessary to encode the special characters in the request, panos_op module absolutely will not work for this task.
+      vars:
+        org: "Spaced Organization"
+        oum: "Spaced Organization Unit Memeber"
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}/api/?type=op&cmd=<request><certificate><generate><ca>no</ca><name>{{ cert_name }}</name><certificate-name>{{ cert_filename }}</certificate-name><organization>{{ org | urlencode }}</organization><organization-unit><member>{{ oum | urlencode }}</member></organization-unit><email>email@email.com</email><country-code>US</country-code><state>Georgia</state><locality>Atlanta</locality><algorithm><RSA><rsa-nbits>2048</rsa-nbits></RSA></algorithm><signed-by>external</signed-by></generate></certificate></request>&key={{ pa_api_key }}"
+        validate_certs: no
+      register: csr_output
+      no_log: true
+
+    - name: Export CSR from device
+      paloaltonetworks.panos.panos_export:
+        provider: "{{ device }}"
+        category: certificate
+        certificate_name: "{{ cert_filename }}"
+        certificate_format: pkcs10
+        filename: "/tmp/{{ cert_name }}.csr"
+        certificate_include_keys: false
+      register: csr_export
+
+    - name: Grab CSR for enrollment
+      ansible.builtin.shell: "cat /tmp/{{ cert_name }}.csr"
+      register: csr_content
+
+    - name: Enroll CSR import with Venafi
+      ansible.builtin.uri:
+        url: "https://{{ venafi_server }}/vedsdk/certificates/Request"
+        method: POST
+        timeout: 30
+        headers:
+          Content-Type: "application/json"
+          Accept: "application/json"
+          Authorization: "Bearer {{ access_token }}"
+        body:
+          PolicyDN: "\\VED\\Policy\\Certificates\\YOUR\\POLICY"
+          CADN: "\\VED\\Policy\\Administration\\CAs\\YOUR_TEMPLATE"
+          PKCS10: "{{ csr_content.stdout }}"
+        body_format: json
+      register: enroll
+      delegate_to: localhost
+      until: enroll.status == 200
+      retries: 10
+      delay: 15
+      no_log: true
+
+    - name: Download certificate(s) from Venafi
+      vars:
+        cdn_path: '\VED\Policy\Certificates\YOUR\TEMPLATE\{{ cert_name }}'
+      ansible.builtin.uri:
+        # All arguments must be passed into the url
+        url: "https://{{ venafi_server }}/vedsdk/certificates/Retrieve?CertificateDN={{ cdn_path | urlencode }}&Format=Base64&IncludePrivateKey=false&IncludeChain=true&RootFirstOrder=true"
+        method: GET
+        timeout: 30
+        headers:
+          Content-Type: "application/json"
+          Accept: "application/json"
+          Authorization: "Bearer {{ access_token }}"
+        dest: /tmp/{{ cert_name }}.pem
+        validate_certs: no
+        return_content: true
+      register: cert_download
+      delegate_to: localhost
+      retries: 10
+      delay: 15
+      until: cert_download.status == 200
+      no_log: true
+
+  # The next 4 tasks aren't absolutely necessary, but sometimes Palo doesn't like the special characters in the certificate name.
+
+    - name: Read the certificate file
+      ansible.builtin.slurp:
+        src: "/tmp/{{ cert_name }}.pem"
+      register: cert_content
+
+    - name: Remove the subject and issuer headers from the certificate
+      ansible.builtin.set_fact:
+        cleaned_cert: "{{ cert_content.content | b64decode | regex_replace('subject=.*\\n', '') | regex_replace('issuer=.*\\n', '') }}"
+
+    - name: Write the cleaned certificate back to pem file
+      ansible.builtin.copy:
+        content: "{{ cleaned_cert }}"
+        dest: "/tmp/{{ cert_name }}.pem"
+
+    - name: Show the contents of the clean pem file
+      ansible.builtin.shell: "cat /tmp/{{ cert_name }}.pem"
+      register: show_pem_clean
+
+  # End of optional tasks
+
+    - name: Install Certificate on PanOS Device
+      paloaltonetworks.panos.panos_import:
+        provider: '{{ device }}'
+        category: certificate
+        certificate_name: "{{ cert_filename }}"
+        format: pem
+        filename: '/tmp/{{ cert_name }}.pem'
+      register: install_panos
+
+
+...
